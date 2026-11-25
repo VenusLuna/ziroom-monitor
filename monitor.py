@@ -803,6 +803,14 @@ def send_new_rooms_rich(cfg: dict, events: list[dict], conn: sqlite3.Connection,
     for e in new:
         lines = _room_lines(conn, e["id"]) or [e.get("name") or "", e.get("url") or ""]
         paragraphs.append([{"tag": "text", "text": "\n".join(l for l in lines if l)}])
+        # 图片文件可能不在本机（例如表里已有 file_token 但新机器上没下载过），缺就补下
+        for row in conn.execute("SELECT path, url FROM images WHERE room_id=? "
+                                "AND file_token IS NOT NULL", (e["id"],)).fetchall():
+            if not Path(row["path"]).exists() and row["url"]:
+                try:
+                    _download(row["url"], Path(row["path"]))
+                except Exception as exc:
+                    print(f"[warn] 补下图失败 {row['path']}: {exc}", file=sys.stderr)
         pics = conn.execute("SELECT path FROM images WHERE room_id=? AND file_token IS NOT NULL "
                             "ORDER BY idx LIMIT 2", (e["id"],)).fetchall()
         for p in pics:
