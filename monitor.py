@@ -791,7 +791,8 @@ def _room_lines(conn: sqlite3.Connection, rid: str) -> list[str]:
 def send_new_rooms_rich(cfg: dict, events: list[dict], conn: sqlite3.Connection,
                         max_rooms: int = 3) -> bool:
     """新上架走飞书富文本：文字详情 + 房源图。没有图或没新增就返回 False（退回纯文本）。"""
-    new = [e for e in events if e["kind"] == "new"][:max_rooms]
+    all_new = [e for e in events if e["kind"] == "new"]
+    new = all_new[:max_rooms]
     if not new:
         return False
     token = _feishu_token(cfg["app_id"], cfg["app_secret"])
@@ -818,6 +819,11 @@ def send_new_rooms_rich(cfg: dict, events: list[dict], conn: sqlite3.Connection,
     if not with_pic:
         return False
 
+    for e in all_new[max_rooms:]:
+        dist = f" · {e['distance_km']:.2f}km" if e.get("distance_km") is not None else ""
+        paragraphs.append([{"tag": "text", "text":
+                            f"🆕 {e['name']} ¥{e['price']}/月{dist}\n{e['url']}"}])
+
     others = [e for e in events if e["kind"] != "new"]
     if others:
         paragraphs.append([{"tag": "text", "text": "\n".join(
@@ -825,7 +831,7 @@ def send_new_rooms_rich(cfg: dict, events: list[dict], conn: sqlite3.Connection,
 
     payload = {"receive_id": open_id, "msg_type": "post",
                "content": json.dumps({"zh_cn": {
-                   "title": f"🏠 新上架 {len(new)} 套 · {now()}",
+                   "title": f"🏠 新上架 {len(all_new)} 套 · {now()}",
                    "content": paragraphs}}, ensure_ascii=False)}
     resp = _feishu_post(f"{FEISHU_API}/im/v1/messages?receive_id_type=open_id", payload, token)
     if resp.get("code"):
