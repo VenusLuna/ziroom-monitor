@@ -20,7 +20,9 @@
         <string>--sheet</string>
         <string>--images</string>
         <string>--image-limit</string>
-        <string>30</string>
+        <string>60</string>
+        <string>--workers</string>
+        <string>16</string>
     </array>
 
     <key>WorkingDirectory</key>

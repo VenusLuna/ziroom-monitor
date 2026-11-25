@@ -36,6 +36,7 @@ import time
 import urllib.parse
 import urllib.request
 import uuid
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -104,7 +105,8 @@ def connect(path: str) -> sqlite3.Connection:
     cols = {r[1] for r in conn.execute("PRAGMA table_info(rooms)")}
     for col, typ in (("distance_km", "REAL"), ("house_type", "INTEGER"), ("bedroom", "INTEGER"),
                      ("code", "TEXT"), ("floor", "TEXT"), ("floor_total", "TEXT"),
-                     ("inv_no", "TEXT")):
+                     ("inv_no", "TEXT"), ("orientation", "TEXT"), ("mate_text", "TEXT"),
+                     ("has_lift", "TEXT")):
         if col not in cols:  # 老库平滑升级
             conn.execute(f"ALTER TABLE rooms ADD COLUMN {col} {typ}")
             conn.commit()
@@ -140,13 +142,15 @@ def record(conn: sqlite3.Connection, rooms: list[dict], threshold: int) -> list[
             conn.execute(
                 """INSERT INTO rooms (id,name,price,district,bizcircle,resblock,area,
                        sale_status,sale_status_text,url,first_seen,last_seen,miss_count,distance_km,
-                       house_type,bedroom,code,floor,floor_total,inv_no,active)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,1)""",
+                       house_type,bedroom,code,floor,floor_total,inv_no,orientation,
+                       mate_text,has_lift,active)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,?,?,?,?,1)""",
                 (rid, room["name"], room["price"], room["district"], room["bizcircle"],
                  room["resblock"], room["area"], room["sale_status"], room["sale_status_text"],
                  room["url"], ts, ts, room.get("distance_km"),
                  room.get("house_type"), room.get("bedroom"), room.get("code"),
-                 room.get("floor"), room.get("floor_total"), room.get("inv_no")),
+                 room.get("floor"), room.get("floor_total"), room.get("inv_no"),
+                 room.get("orientation"), room.get("mate_text"), room.get("has_lift")),
             )
             events.append({"kind": "new", "id": rid, "name": room["name"],
                            "price": room["price"], "district": room["district"],
@@ -170,13 +174,16 @@ def record(conn: sqlite3.Connection, rooms: list[dict], threshold: int) -> list[
             """UPDATE rooms SET name=?, price=?, district=?, bizcircle=?, resblock=?, area=?,
                    sale_status=?, sale_status_text=?, url=?, last_seen=?, miss_count=0, active=1,
                    distance_km=COALESCE(?, distance_km), house_type=?, bedroom=?, code=?,
-                   floor=?, floor_total=?, inv_no=COALESCE(?, inv_no)
+                   floor=?, floor_total=?, inv_no=COALESCE(?, inv_no),
+                   orientation=COALESCE(?, orientation), mate_text=COALESCE(?, mate_text),
+                   has_lift=COALESCE(?, has_lift)
                WHERE id=?""",
             (room["name"], room["price"], room["district"], room["bizcircle"], room["resblock"],
              room["area"], room["sale_status"], room["sale_status_text"], room["url"], ts,
              room.get("distance_km"), room.get("house_type"), room.get("bedroom"),
              room.get("code"), room.get("floor"), room.get("floor_total"),
-             room.get("inv_no"), rid),
+             room.get("inv_no"), room.get("orientation"), room.get("mate_text"),
+             room.get("has_lift"), rid),
         )
 
     # 未出现的房源：累计 miss，达到阈值判定下架
@@ -301,6 +308,8 @@ BITABLE_FIELDS = [
     ("小区", 1, None),
     ("户型", 1, None),
     ("几居", 2, {"formatter": "0"}),
+    ("朝向", 1, None),
+    ("合租舍友", 1, None),
     ("价格", 2, {"formatter": "0"}),
     ("面积㎡", 2, {"formatter": "0.0"}),
     ("距离km", 2, {"formatter": "0.00"}),
@@ -371,8 +380,8 @@ IMAGES_DIR = Path("images")
 PER_ROOM_IMAGES = 3
 
 
-def _upload_media(token: str, app: str, path: Path) -> str:
-    """上传本地图片到多维表格附件位，返回 file_token。"""
+def _upload_media(token: str, app: str, path: Path, attempts: int = 5) -> str:
+    """上传本地图片到多维表格附件位，返回 file_token。飞书限频（99991400）自动退避重试。"""
     data = path.read_bytes()
     boundary = "----ziroom" + uuid.uuid4().hex
 
@@ -390,13 +399,22 @@ def _upload_media(token: str, app: str, path: Path) -> str:
         f"{FEISHU_API}/drive/v1/medias/upload_all", data=body,
         headers={"Authorization": f"Bearer {token}",
                  "Content-Type": f"multipart/form-data; boundary={boundary}"})
-    try:
-        resp = json.loads(urllib.request.urlopen(req, timeout=120).read() or b"{}")
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"上传图片 HTTP {e.code}: {e.read()[:200]!r}")
-    if resp.get("code"):
-        raise RuntimeError(f"上传图片失败: {resp}")
-    return resp["data"]["file_token"]
+    for i in range(attempts):
+        try:
+            resp = json.loads(urllib.request.urlopen(req, timeout=120).read() or b"{}")
+        except urllib.error.HTTPError as e:
+            text = e.read().decode(errors="replace")
+            if "99991400" in text and i + 1 < attempts:  # 请求过快
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise RuntimeError(f"上传图片 HTTP {e.code}: {text[:200]}")
+        if resp.get("code") == 99991400 and i + 1 < attempts:
+            time.sleep(1.5 * (i + 1))
+            continue
+        if resp.get("code"):
+            raise RuntimeError(f"上传图片失败: {resp}")
+        return resp["data"]["file_token"]
+    raise RuntimeError("上传图片：重试多次仍被限频")
 
 
 def _download(url: str, dest: Path) -> None:
@@ -406,8 +424,29 @@ def _download(url: str, dest: Path) -> None:
         dest.write_bytes(r.read())
 
 
+def _grab_one(client: Ziroom, row, per_room: int) -> tuple[str, list[tuple[int, str, str]]]:
+    """单套房抓图到本地（线程里跑，返回待写库的元数据）。"""
+    rid = row["id"]
+    inv = row["inv_no"] or ""
+    if not inv:  # 老库没有 inv_no，从详情链接里捞
+        m = re.search(r"/x/(\d+)\.html", row["url"] or "")
+        inv = m.group(1) if m else ""
+    media = client.room_media(rid, inv_no=inv)
+    saved = []
+    for i, m in enumerate(media[:per_room], 1):
+        url = m["image"]
+        if url.endswith(".webp"):  # CDN 只改扩展名就能拿到 jpg，附件预览兼容性最好
+            url = url[:-5] + ".jpg"
+        dest = IMAGES_DIR / rid / f"{i}.jpg"
+        if not dest.exists():
+            _download(url, dest)
+        saved.append((i, str(dest), url))
+    return rid, saved
+
+
 def fetch_images(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
-                 limit: int = 20, per_room: int = PER_ROOM_IMAGES) -> tuple[int, int]:
+                 limit: int = 20, per_room: int = PER_ROOM_IMAGES,
+                 workers: int = 8) -> tuple[int, int]:
     """给还没有图的房源补图：下载到 images/<id>/，再传多维表格换 file_token。
 
     返回 (本次新增抓图的房源数, 本次补传的图片数)。没配多维表格时只存本地。
@@ -422,54 +461,42 @@ def fetch_images(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
             WHERE active=1 AND id NOT IN (SELECT room_id FROM images)
             ORDER BY distance_km, price LIMIT ?""", (limit,)).fetchall()
     fetched = 0
-    for row in todo:
-        rid = row["id"]
-        try:
-            inv = row["inv_no"] or ""
-            if not inv:  # 老库没有 inv_no，从详情链接里捞
-                m = re.search(r"/x/(\d+)\.html", row["url"] or "")
-                inv = m.group(1) if m else ""
-            media = client.room_media(rid, inv_no=inv)
-        except ZiroomError as e:
-            print(f"[warn] {rid} 取图失败: {e}", file=sys.stderr)
-            continue
-        if not media:
-            continue
-        for i, m in enumerate(media[:per_room], 1):
-            # 图片 CDN 只改扩展名就能拿到 jpg，飞书附件预览 jpg 兼容性最好
-            url = m["image"]
-            if url.endswith(".webp"):
-                url = url[:-5] + ".jpg"
-            dest = IMAGES_DIR / rid / f"{i}.jpg"
+    workers = max(1, int(workers or 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_grab_one, client, row, per_room): row["id"] for row in todo}
+        for f in as_completed(futs):
+            rid = futs[f]
             try:
-                if not dest.exists():
-                    _download(url, dest)
+                rid, saved = f.result()
+            except Exception as e:  # 单套失败不影响其它
+                print(f"[warn] {rid} 取图失败: {e}", file=sys.stderr)
+                continue
+            for i, path, url in saved:
                 conn.execute(
                     "INSERT OR REPLACE INTO images (room_id, idx, path, url, file_token, ts) "
-                    "VALUES (?,?,?,?,NULL,?)", (rid, i, str(dest), url, now()))
-            except Exception as e:  # 单张失败不影响其它图
-                print(f"[warn] {rid} 图{i} 下载失败: {e}", file=sys.stderr)
-        conn.commit()
-        fetched += 1
+                    "VALUES (?,?,?,?,NULL,?)", (rid, i, path, url, now()))
+            conn.commit()
+            fetched += 1
 
-    # 本地已有、还没换 token 的，补传
     uploaded = 0
     if token and app:
         pending = conn.execute(
             "SELECT room_id, idx, path FROM images WHERE file_token IS NULL").fetchall()
-        for p in pending:
-            path = Path(p["path"])
-            if not path.exists():
-                continue
-            try:
-                ft = _upload_media(token, app, path)
-            except Exception as e:
-                print(f"[warn] {p['room_id']} 图{p['idx']} 上传失败: {e}", file=sys.stderr)
-                continue
-            conn.execute("UPDATE images SET file_token=? WHERE room_id=? AND idx=?",
-                         (ft, p["room_id"], p["idx"]))
-            conn.commit()
-            uploaded += 1
+        # 图片上传有 QPS 限制，并发压低到 4，配合 _upload_media 里的退避
+        with ThreadPoolExecutor(max_workers=min(workers, 4)) as ex:
+            futs = {ex.submit(_upload_media, token, app, Path(p["path"])): (p["room_id"], p["idx"])
+                    for p in pending if Path(p["path"]).exists()}
+            for f in as_completed(futs):
+                room_id, idx = futs[f]
+                try:
+                    ft = f.result()
+                except Exception as e:
+                    print(f"[warn] {room_id} 图{idx} 上传失败: {e}", file=sys.stderr)
+                    continue
+                conn.execute("UPDATE images SET file_token=? WHERE room_id=? AND idx=?",
+                             (ft, room_id, idx))
+                uploaded += 1
+        conn.commit()
     return fetched, uploaded
 
 
@@ -508,6 +535,8 @@ def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
             "小区": r["resblock"] or r["name"] or "",
             "户型": layout,
             "几居": int(bedroom) if bedroom else None,
+            "朝向": r["orientation"] or "",
+            "合租舍友": r["mate_text"] or "",
             "价格": r["price"],
             "面积㎡": _num(r["area"]),
             "距离km": round(r["distance_km"], 2) if r["distance_km"] is not None else None,
@@ -522,7 +551,8 @@ def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
     return out
 
 
-DIFF_KEYS = ("价格", "距离km", "状态", "户型", "楼层", "小区", "面积㎡", "几居", "链接")
+DIFF_KEYS = ("价格", "距离km", "状态", "户型", "楼层", "小区", "面积㎡", "几居", "链接",
+             "朝向", "合租舍友")
 
 
 def _same(old, new) -> bool:
@@ -607,7 +637,7 @@ def cmd_images(args):
     conn = connect(args.db)
     client = Ziroom()
     fetched, uploaded = fetch_images(conn, client, cfg, limit=args.image_limit,
-                                     per_room=args.per_room)
+                                     per_room=args.per_room, workers=args.workers)
     left = conn.execute("SELECT COUNT(*) FROM rooms WHERE active=1 "
                         "AND id NOT IN (SELECT room_id FROM images)").fetchone()[0]
     conn.close()
@@ -620,8 +650,8 @@ def cmd_sheet(args):
         raise SystemExit("没配置多维表格：feishu.json 需要 bitable_app_token / bitable_table_id")
     conn = connect(args.db)
     if getattr(args, "images", False):
-        fetched, uploaded = fetch_images(conn, Ziroom(), cfg,
-                                         limit=args.image_limit, per_room=args.per_room)
+        fetched, uploaded = fetch_images(conn, Ziroom(), cfg, limit=args.image_limit,
+                                         per_room=args.per_room, workers=args.workers)
         if fetched or uploaded:
             print(f"房源图：抓取 {fetched} 套（上传 {uploaded} 张）")
     created, updated = sync_sheet(cfg, conn, dry_run=getattr(args, "dry_run", False))
@@ -778,38 +808,48 @@ def parse_center(args) -> tuple[float, float]:
     return DEFAULT_CENTER
 
 
+def _one_building(client: Ziroom, b: dict, args) -> list[dict]:
+    """单栋楼的全部在租房源（线程池里跑，不碰数据库）。"""
+    out: list[dict] = []
+    page = 1
+    while page <= 5:
+        batch, _ = client.resblock_rooms(b["building_code"], city_code=args.city,
+                                        page=page, size=args.size)
+        for r in batch:
+            n = normalize(r)
+            if args.max_price and (n["price"] or 0) > args.max_price:
+                continue
+            n["distance_km"] = b["distance_km"]
+            n["resblock"] = n["resblock"] or b.get("building_name") or ""
+            out.append(n)
+        if len(batch) < args.size:
+            break
+        page += 1
+    return out
+
+
 def fetch_nearby(client: Ziroom, args) -> tuple[list[dict], str]:
-    """半径内所有楼栋逐一拉房源（只查起价不超预算的楼栋）。"""
+    """半径内所有楼栋并发拉房源（只查起价不超预算的楼栋）。"""
     lat, lng = parse_center(args)
     blds = client.buildings_near(lat, lng, args.radius, city_code=args.city)
+    todo = [b for b in blds
+            if not (args.max_price and b.get("min_price") and b["min_price"] > args.max_price)]
     rooms: dict[str, dict] = {}
     queried = 0
-    for b in blds:
-        min_price = b.get("min_price")
-        if args.max_price and min_price and min_price > args.max_price:
-            continue
-        try:
-            page = 1
-            while page <= 5:
-                batch, _ = client.resblock_rooms(b["building_code"], city_code=args.city,
-                                                 page=page, size=args.size)
-                for r in batch:
-                    n = normalize(r)
-                    if args.max_price and (n["price"] or 0) > args.max_price:
-                        continue
-                    n["distance_km"] = b["distance_km"]
-                    n["resblock"] = n["resblock"] or b.get("building_name") or ""
-                    rooms[n["id"]] = n
-                if len(batch) < args.size:
-                    break
-                page += 1
-                time.sleep(args.delay)
-        except ZiroomError as e:
-            print(f"[warn] {b.get('building_name')} 拉取失败: {e}", file=sys.stderr)
-            continue
-        queried += 1
-        time.sleep(args.delay)
-    note = f"{len(blds)} 栋楼（{queried} 栋有在租且在预算内）"
+    workers = max(1, int(getattr(args, "workers", 8) or 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_one_building, client, b, args): b for b in todo}
+        for f in as_completed(futs):
+            b = futs[f]
+            try:
+                got = f.result()
+            except Exception as e:  # 单栋失败不影响整体
+                print(f"[warn] {b.get('building_name')} 拉取失败: {e}", file=sys.stderr)
+                continue
+            queried += 1
+            for n in got:
+                rooms[n["id"]] = n
+    note = f"{len(blds)} 栋楼（{queried} 栋有在租且在预算内，{workers} 并发）"
     return list(rooms.values()), note
 
 
@@ -834,8 +874,8 @@ def sweep(args) -> list[dict]:
     notify(cfg, to_send)
     if getattr(args, "images", False):
         try:
-            fetched, uploaded = fetch_images(conn, client, cfg,
-                                             limit=args.image_limit, per_room=args.per_room)
+            fetched, uploaded = fetch_images(conn, client, cfg, limit=args.image_limit,
+                                             per_room=args.per_room, workers=args.workers)
             if fetched or uploaded:
                 print(f"房源图：抓取 {fetched} 套（上传 {uploaded} 张）")
         except Exception as e:  # 抓图失败不影响主流程
@@ -1084,6 +1124,8 @@ def main():
         parser.add_argument("--pages", type=int, default=d(5), help="每次扫描的页数（每页 20 条）")
         parser.add_argument("--size", type=int, default=d(20), help="每页条数，接口上限 20")
         parser.add_argument("--delay", type=float, default=d(0.4), help="翻页间隔秒数")
+        parser.add_argument("--workers", type=int, default=d(8),
+                            help="并发数（near 扫楼、抓图共用），默认 8")
         parser.add_argument("--misses", type=int, default=d(3), help="连续多少次未出现判定下架")
         parser.add_argument("--interval", type=int, default=d(600), help="watch 模式扫描间隔秒")
         parser.add_argument("--webhook", default=d(None), help="事件推送 URL（飞书/钉钉/自定义）")

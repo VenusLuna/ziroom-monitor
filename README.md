@@ -104,7 +104,18 @@ python3 -m venv .venv
 
 - 本地：`images/<房源ID>/1.jpg`（CDN 上把 URL 的 `.webp` 换成 `.jpg` 就是同一张图的 JPEG，飞书预览兼容性更好）。
 - 表格：附件列「房源图」，每套 3 张。上传走 `/open-apis/drive/v1/medias/upload_all`（`parent_type=bitable_image`），换回的 `file_token` 记在 SQLite `images` 表里复用，不重复上传。
-- 增量：`images` 表里已有的房源不再抓；全量 400+ 套首次补齐要跑几轮 `--image-limit`（默认 20，定时任务里是 30）。
+- 增量：`images` 表里已有的房源不再抓；`--image-limit 500` 可一次补齐（并发由 `--workers` 控制）。
+- 并发：扫楼、下图、传图都走线程池，`--workers 16` 时一轮扫描约 20 秒、400 套图约 3 分钟。
+
+## 舍友信息
+
+列表接口的 `brief.室友` 直接带每个卧室的性别和昵称，`normalize()` 会算出「几男几女」：
+
+```
+2男0女（01男、02男）     # 排除自己那间（按 code 匹配）
+```
+
+写进表里的「合租舍友」列，同时补「朝向」（`brief.朝向`）。老库第一次跑会写 NULL，下一轮扫描或 `once --near` 就会补齐。
 
 ## 定时任务（macOS）
 

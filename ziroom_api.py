@@ -335,9 +335,22 @@ def haversine(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
 # ---------------------------------------------------------------- 归一化
 
 
+def roommate_text(brief: dict, own_code: str = "") -> str:
+    """brief.室友 → "2男0女（01男、02女）"。own_code 是自己的卧室号，不计入舍友。"""
+    mates = [m for m in (brief or {}).get("室友") or [] if isinstance(m, dict)]
+    others = [m for m in mates if str(m.get("卧室") or "") != str(own_code or "")]
+    if not others:
+        return ""
+    male = sum(1 for m in others if m.get("性别") == "男")
+    female = sum(1 for m in others if m.get("性别") == "女")
+    who = "、".join(f"{m.get('卧室')}{m.get('性别')}" for m in others)
+    return f"{male}男{female}女（{who}）"
+
+
 def normalize(room: dict) -> dict:
     """把接口里字段极多的房源对象压成监控关心的那几列。"""
     tags = [t.get("title") for t in room.get("tags") or [] if isinstance(t, dict) and t.get("title")]
+    brief = room.get("brief") or {}
     inv = room.get("inv_no")
     return {
         "id": str(room.get("id")),
@@ -357,4 +370,7 @@ def normalize(room: dict) -> dict:
         "inv_no": inv,
         "url": room.get("link") or (f"https://www.ziroom.com/x/{inv}.html" if inv else ""),
         "tags": tags,
+        "orientation": brief.get("朝向") or "",
+        "mate_text": roommate_text(brief, room.get("code") or ""),
+        "has_lift": brief.get("电梯") or "",
     }
