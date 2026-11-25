@@ -1,0 +1,21 @@
+# 本机运行产物
+.venv/
+__pycache__/
+*.pyc
+logs/
+
+# 数据与抓包（含真实房源/账号痕迹，不入库）
+*.db
+*.har
+*.log
+
+# 凭据（都放在 ~/.config/ziroom/，0600）
+key.json
+token.json
+feishu.json
+
+# macOS
+.DS_Store
+
+# 本地生成的 launchd 配置（含绝对路径，由 install_launchd.sh 生成）
+com.ziroom.monitor.plist
