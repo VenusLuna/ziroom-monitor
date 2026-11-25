@@ -19,3 +19,6 @@ feishu.json
 
 # 本地生成的 launchd 配置（含绝对路径，由 install_launchd.sh 生成）
 com.ziroom.monitor.plist
+
+# 房源图（本地缓存，体积大）
+images/

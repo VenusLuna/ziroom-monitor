@@ -18,6 +18,9 @@
         <string>--notify-kinds</string>
         <string>new,gone,price,status</string>
         <string>--sheet</string>
+        <string>--images</string>
+        <string>--image-limit</string>
+        <string>30</string>
     </array>
 
     <key>WorkingDirectory</key>

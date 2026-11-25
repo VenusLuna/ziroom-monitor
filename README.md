@@ -91,6 +91,20 @@ python3 -m venv .venv
 - 只有新增行、价格或距离变化才写，避免每 2 小时刷 419 行；用户自己加的列不会被覆盖。
 - 下架房源不删行，状态列写成 `已下架`。
 
+## 房源图
+
+房源图来自详情接口 `/thorApi/v1/detail/media.json`（要 `id` + `house_code` + `inv_no` 三个字段，缺一个返回 500），按卧室/起居室/厨房等分组。图存两处：
+
+```bash
+.venv/bin/python monitor.py images --db near.db --image-limit 20   # 抓 20 套（每套 3 张）
+.venv/bin/python monitor.py sheet  --db near.db --images           # 同步前先补图
+.venv/bin/python monitor.py once --near --sheet --images           # 扫描 + 抓图 + 同步
+```
+
+- 本地：`images/<房源ID>/1.jpg`（CDN 上把 URL 的 `.webp` 换成 `.jpg` 就是同一张图的 JPEG，飞书预览兼容性更好）。
+- 表格：附件列「房源图」，每套 3 张。上传走 `/open-apis/drive/v1/medias/upload_all`（`parent_type=bitable_image`），换回的 `file_token` 记在 SQLite `images` 表里复用，不重复上传。
+- 增量：`images` 表里已有的房源不再抓；全量 400+ 套首次补齐要跑几轮 `--image-limit`（默认 20，定时任务里是 30）。
+
 ## 定时任务（macOS）
 
 ```bash
@@ -100,6 +114,24 @@ launchctl bootout gui/$(id -u)/com.ziroom.monitor        # 停掉
 ```
 
 日志：`logs/monitor.log`、`logs/monitor.err`。
+
+## 部署到服务器（Linux）
+
+4C8G 之类的云主机（Ubuntu/Debian/CentOS 都行）上：
+
+```bash
+sudo apt install -y python3-venv        # CentOS: dnf install python3
+git clone <repo> ~/ziroomer && cd ~/ziroomer
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+mkdir -p ~/.config/ziroom && chmod 700 ~/.config/ziroom
+# 把本机 ~/.config/ziroom/{key.json,feishu.json} 拷过去，权限 600
+./install_systemd.sh                    # 用户级 timer，每 2 小时，不需 sudo
+loginctl enable-linger "$USER"          # 让 timer 在未登录时也跑
+```
+
+- 资源占用：一轮约 120 秒、常驻内存 < 100MB、CPU 几乎为 0，1C1G 都够；图片缓存 `images/` 全量约 90MB（400 套 × 3 张 × 70KB）。
+- 服务器上不需要 launchd 那套；`monitor.py login` 需要浏览器拖滑块，在服务器上不方便，建议在本地登录后把 `~/.config/ziroom/token.json` 拷过去（房源列表是匿名接口，token 过期不影响扫描）。
+- 时区：日志与「首次发现/最近更新」用本机时区，服务器是 UTC 时先 `timedatectl set-timezone Asia/Shanghai`。
 
 ## 登录（可选）
 

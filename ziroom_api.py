@@ -230,6 +230,26 @@ class Ziroom:
         """单个小区/楼栋的在租房源。"""
         return self.list_rooms(city_code=city_code, resblock_id=resblock_id, **kw)
 
+    def room_media(self, room_id: str, inv_no: str = "", house_code: str = "") -> list[dict]:
+        """房源图集，按 tab（03卧/起居室/厨房…）分组，返回 [{"tab","image","image_id"}]。
+
+        缺 inv_no / house_code 时接口返回 500，必须三个字段一起给。
+        """
+        data = self.post("/thorApi/v1/detail/media.json", {
+            "id": str(room_id),
+            "uid": "0",
+            "house_code": str(house_code or room_id),
+            "inv_no": str(inv_no or ""),
+        })
+        out = []
+        for tab in data.get("tabs") or []:
+            for p in tab.get("photos") or []:
+                if isinstance(p, dict) and p.get("image"):
+                    out.append({"tab": tab.get("title") or "",
+                                "image": p["image"],
+                                "image_id": p.get("image_id") or ""})
+        return out
+
     def map_regions(self, min_lng, min_lat, max_lng, max_lat,
                     center_lng=None, center_lat=None, city_code: str = "110000") -> dict:
         """地图视野内的楼栋聚合（含每栋在租套数、起价），用于发现小区。"""
