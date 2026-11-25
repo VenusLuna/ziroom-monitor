@@ -446,7 +446,7 @@ def _grab_one(client: Ziroom, row, per_room: int) -> tuple[str, list[tuple[int, 
 
 def fetch_images(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
                  limit: int = 20, per_room: int = PER_ROOM_IMAGES,
-                 workers: int = 8) -> tuple[int, int]:
+                 workers: int = 8, only_ids: list[str] | None = None) -> tuple[int, int]:
     """给还没有图的房源补图：下载到 images/<id>/，再传多维表格换 file_token。
 
     返回 (本次新增抓图的房源数, 本次补传的图片数)。没配多维表格时只存本地。
@@ -456,10 +456,16 @@ def fetch_images(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
         token = _feishu_token(cfg["app_id"], cfg["app_secret"])
     app = cfg.get("bitable_app_token")
 
-    todo = conn.execute(
-        """SELECT id, inv_no, url FROM rooms
-            WHERE active=1 AND id NOT IN (SELECT room_id FROM images)
-            ORDER BY distance_km, price LIMIT ?""", (limit,)).fetchall()
+    if only_ids:
+        marks = ",".join("?" * len(only_ids))
+        todo = conn.execute(
+            f"""SELECT id, inv_no, url FROM rooms WHERE id IN ({marks})
+                 AND id NOT IN (SELECT room_id FROM images)""", list(only_ids)).fetchall()
+    else:
+        todo = conn.execute(
+            """SELECT id, inv_no, url FROM rooms
+                WHERE active=1 AND id NOT IN (SELECT room_id FROM images)
+                ORDER BY distance_km, price LIMIT ?""", (limit,)).fetchall()
     fetched = 0
     workers = max(1, int(workers or 8))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -498,6 +504,37 @@ def fetch_images(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
                 uploaded += 1
         conn.commit()
     return fetched, uploaded
+
+
+def upload_message_image(token: str, path: Path) -> str:
+    """把图片传成「消息图片」，返回 image_key（私聊富文本里贴图用）。"""
+    data = path.read_bytes()
+    boundary = "----ziroom" + uuid.uuid4().hex
+    body = (f'--{boundary}\r\nContent-Disposition: form-data; name="image_type"\r\n\r\n'
+            f'message\r\n').encode()
+    body += (f'--{boundary}\r\nContent-Disposition: form-data; name="image"; '
+             f'filename="{path.name}"\r\nContent-Type: image/jpeg\r\n\r\n').encode()
+    body += data + b"\r\n" + f"--{boundary}--\r\n".encode()
+    req = urllib.request.Request(
+        f"{FEISHU_API}/im/v1/images", data=body,
+        headers={"Authorization": f"Bearer {token}",
+                 "Content-Type": f"multipart/form-data; boundary={boundary}"})
+    for i in range(5):
+        try:
+            resp = json.loads(urllib.request.urlopen(req, timeout=120).read() or b"{}")
+        except urllib.error.HTTPError as e:
+            text = e.read().decode(errors="replace")
+            if "99991400" in text and i < 4:
+                time.sleep(1.5 * (i + 1))
+                continue
+            raise RuntimeError(f"传消息图片 HTTP {e.code}: {text[:200]}")
+        if resp.get("code") == 99991400 and i < 4:
+            time.sleep(1.5 * (i + 1))
+            continue
+        if resp.get("code"):
+            raise RuntimeError(f"传消息图片失败: {resp}")
+        return resp["data"]["image_key"]
+    raise RuntimeError("传消息图片：重试多次仍被限频")
 
 
 def _ms(ts: str | None) -> int | None:
@@ -541,7 +578,7 @@ def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
             "面积㎡": _num(r["area"]),
             "距离km": round(r["distance_km"], 2) if r["distance_km"] is not None else None,
             "楼层": floor,
-            "状态": r["sale_status_text"] or ("已下架" if not r["active"] else ""),
+            "状态": ("已下架" if not r["active"] else "") or r["sale_status_text"] or "",
             "链接": {"link": r["url"], "text": "打开房源"} if r["url"] else None,
             "首次发现": _ms(r["first_seen"]),
             "最近更新": _ms(r["last_seen"]),
@@ -729,7 +766,74 @@ def send_webhook(url: str, secret: str | None, text: str) -> None:
         print(f"[warn] webhook 返回: {resp}", file=sys.stderr)
 
 
-def notify(cfg: dict | None, events: list[dict]) -> None:
+def _room_lines(conn: sqlite3.Connection, rid: str) -> list[str]:
+    row = conn.execute("SELECT * FROM rooms WHERE id=?", (rid,)).fetchone()
+    if row is None:
+        return []
+    bits = [f"¥{row['price']}/月" if row["price"] else ""]
+    if row["distance_km"] is not None:
+        bits.append(f"{row['distance_km']:.2f}km")
+    if row["area"]:
+        bits.append(f"{row['area']}㎡")
+    if row["orientation"]:
+        bits.append(f"朝{row['orientation']}")
+    if row["floor"]:
+        bits.append(f"{row['floor']}/{row['floor_total'] or '?'}层")
+    if row["mate_text"]:
+        bits.append(row["mate_text"])
+    if row["sale_status_text"]:
+        bits.append(row["sale_status_text"])
+    head = " · ".join(b for b in bits if b)
+    tail = f"\n{row['resblock'] or ''} {row['bizcircle'] or ''} {row['district'] or ''}".strip()
+    return [row["name"] or "", head, tail, row["url"] or ""]
+
+
+def send_new_rooms_rich(cfg: dict, events: list[dict], conn: sqlite3.Connection,
+                        max_rooms: int = 3) -> bool:
+    """新上架走飞书富文本：文字详情 + 房源图。没有图或没新增就返回 False（退回纯文本）。"""
+    new = [e for e in events if e["kind"] == "new"][:max_rooms]
+    if not new:
+        return False
+    token = _feishu_token(cfg["app_id"], cfg["app_secret"])
+    open_id = cfg.get("open_id") or _feishu_open_id(token, cfg.get("mobile", ""))
+
+    paragraphs: list[list[dict]] = []
+    with_pic = 0
+    for e in new:
+        lines = _room_lines(conn, e["id"]) or [e.get("name") or "", e.get("url") or ""]
+        paragraphs.append([{"tag": "text", "text": "\n".join(l for l in lines if l)}])
+        pics = conn.execute("SELECT path FROM images WHERE room_id=? AND file_token IS NOT NULL "
+                            "ORDER BY idx LIMIT 2", (e["id"],)).fetchall()
+        for p in pics:
+            path = Path(p["path"])
+            if not path.exists():
+                continue
+            try:
+                key = upload_message_image(token, path)
+            except Exception as exc:  # 单张失败不影响整条消息
+                print(f"[warn] 消息配图失败: {exc}", file=sys.stderr)
+                continue
+            paragraphs.append([{"tag": "img", "image_key": key}])
+            with_pic += 1
+    if not with_pic:
+        return False
+
+    others = [e for e in events if e["kind"] != "new"]
+    if others:
+        paragraphs.append([{"tag": "text", "text": "\n".join(
+            build_message(others).split("\n")[1:]) or ""}])
+
+    payload = {"receive_id": open_id, "msg_type": "post",
+               "content": json.dumps({"zh_cn": {
+                   "title": f"🏠 新上架 {len(new)} 套 · {now()}",
+                   "content": paragraphs}}, ensure_ascii=False)}
+    resp = _feishu_post(f"{FEISHU_API}/im/v1/messages?receive_id_type=open_id", payload, token)
+    if resp.get("code"):
+        raise RuntimeError(f"发富文本失败: {resp}")
+    return True
+
+
+def notify(cfg: dict | None, events: list[dict], conn: sqlite3.Connection | None = None) -> None:
     """按配置选后端：有 webhook 走群机器人，否则用自建应用发私聊。"""
     if not cfg or not events:
         return
@@ -738,8 +842,11 @@ def notify(cfg: dict | None, events: list[dict]) -> None:
         if cfg.get("webhook"):
             send_webhook(cfg["webhook"], cfg.get("secret"), text)
         elif cfg.get("app_id") and cfg.get("app_secret"):
-            open_id = send_feishu_dm(cfg, text)
-            print(f"  已推送飞书私聊 → {open_id}")
+            rich = False
+            if conn is not None:
+                rich = send_new_rooms_rich(cfg, events, conn)
+            open_id = (cfg.get("open_id") or "已推送") if rich else send_feishu_dm(cfg, text)
+            print(f"  已推送飞书私聊{'（富文本+房源图）' if rich else ''} → {open_id}")
         else:
             print("[warn] 未配置推送：feishu.json 需要 webhook 或 app_id/app_secret",
                   file=sys.stderr)
@@ -871,7 +978,15 @@ def sweep(args) -> list[dict]:
     kinds = {k.strip() for k in (args.notify_kinds or "").split(",") if k.strip()}
     to_send = [e for e in events if not kinds or e["kind"] in kinds]
     cfg = load_notify(args)
-    notify(cfg, to_send)
+    # 新上架先抓图，推送里才能带上房源照片
+    new_ids = [e["id"] for e in to_send if e["kind"] == "new"]
+    if new_ids:
+        try:
+            fetch_images(conn, client, cfg, per_room=args.per_room,
+                         workers=args.workers, only_ids=new_ids)
+        except Exception as e:  # 抓不到图也要照常推送文字
+            print(f"[warn] 新房源抓图失败: {e}", file=sys.stderr)
+    notify(cfg, to_send, conn)
     if getattr(args, "images", False):
         try:
             fetched, uploaded = fetch_images(conn, client, cfg, limit=args.image_limit,

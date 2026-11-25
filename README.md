@@ -46,7 +46,7 @@ python3 -m venv .venv
 | `new` | 首次出现 |
 | `price` | 价格与上次快照不同 |
 | `status` | 可签约状态文字变化 |
-| `gone` | 连续 `--misses` 次扫描未出现（默认 3） |
+| `gone` | 连续 `--misses` 次扫描未出现（默认 3，定时任务用 2） |
 
 > 列表接口的排序不稳定（同样条件两次请求 20 条会差 3 条左右），所以「下架」必须靠连续缺席计数，不能一次没见到就判死。
 
@@ -70,6 +70,19 @@ python3 -m venv .venv
 
 推送范围由 `--notify-kinds` 控制，默认 `new,gone`，可加 `price,status`。
 
+### 新上架带图推送
+
+有新房源时先抓图（`images/<房源ID>/1.jpg`），再用飞书「富文本」发一条私聊，每条房源一段文字 + 一张照片：
+
+```
+🏠 新上架 1 套 · 2026-11-25 21:36
+北京语言大学校内3居·03卧
+¥3090/月 · 0.10km · 9.54㎡ · 朝南 · 3/5层 · 1男1女（01男、02女） · 可签约
+[房源照片]
+```
+
+文字内容来自 SQLite 快照（价格/距离/面积/朝向/楼层/舍友/状态），图片走 `/open-apis/im/v1/images` 换成 `image_key` 再塞进 post 消息。抓图或传图失败时自动退回纯文本推送，不会漏消息。价格、状态、下架变化仍用纯文本，一条消息汇总。
+
 ## 飞书多维表格
 
 把库内房源同步成一张可以直接排序、筛选的表（字段：房源ID / 小区 / 户型 / 几居 / 价格 / 面积㎡ / 距离km / 楼层 / 状态 / 链接 / 首次发现 / 最近更新）。
@@ -89,7 +102,7 @@ python3 -m venv .venv
 
 - 字段不存在的会自动创建（`ensure_sheet_fields`）；主字段会被改名为 `房源ID`，这是 upsert 的键，别手动改。
 - 只有新增行、价格或距离变化才写，避免每 2 小时刷 419 行；用户自己加的列不会被覆盖。
-- 下架房源不删行，状态列写成 `已下架`。
+- 状态列实时跟随接口：`可签约`→`可预订` 之类的变化会更新，房源连续缺席被判下架后写成 `已下架`（行不删，留作历史）。
 - 「标记」是单选列（候选 / 待看 / 排除），新行默认 **候选**；同步只补空值，**永不覆盖你手改的值**，所以放心在表里筛「待看」「排除」。
 
 ## 房源图
@@ -141,9 +154,30 @@ mkdir -p ~/.config/ziroom && chmod 700 ~/.config/ziroom
 loginctl enable-linger "$USER"          # 让 timer 在未登录时也跑
 ```
 
-- 资源占用：一轮约 120 秒、常驻内存 < 100MB、CPU 几乎为 0，1C1G 都够；图片缓存 `images/` 全量约 90MB（400 套 × 3 张 × 70KB）。
+- 资源占用：`--workers 16` 时一轮约 10 秒（首轮补图除外），常驻内存 < 100MB、CPU 几乎为 0，1C1G 都够；图片缓存 `images/` 全量约 90MB（400 套 × 3 张 × 70KB）。
 - 服务器上不需要 launchd 那套；`monitor.py login` 需要浏览器拖滑块，在服务器上不方便，建议在本地登录后把 `~/.config/ziroom/token.json` 拷过去（房源列表是匿名接口，token 过期不影响扫描）。
 - 时区：日志与「首次发现/最近更新」用本机时区，服务器是 UTC 时先 `timedatectl set-timezone Asia/Shanghai`。
+
+### 免密拉取更新
+
+服务器上挂一把**只读 deploy key**（GitHub → Settings → Deploy keys，或在本地 `gh repo deploy-key add ~/.ssh/xxx.pub`），`~/.ssh/config` 里指到 github.com：
+
+```
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/github_deploy
+  IdentitiesOnly yes
+```
+
+之后更新一条命令：
+
+```bash
+cd ~/ziroomer && git fetch -q origin main && git reset -q --hard origin/main
+systemctl --user restart ziroom-monitor.timer   # 不改 systemd 单元时可不执行
+```
+
+`near.db`、`images/`、`logs/` 都在 `.gitignore` 里，`reset --hard` 不会丢运行数据；改了 `install_systemd.sh` 里的参数才需要重跑它。
 
 ## 登录（可选）
 

@@ -17,6 +17,8 @@
         <string>__PROJECT_DIR__/near.db</string>
         <string>--notify-kinds</string>
         <string>new,gone,price,status</string>
+        <string>--misses</string>
+        <string>2</string>
         <string>--sheet</string>
         <string>--images</string>
         <string>--image-limit</string>
