@@ -88,7 +88,29 @@ launchctl bootout gui/$(id -u)/com.ziroom.monitor        # 停掉
 .venv/bin/python monitor.py token   # 看已保存 token 的 uid 与有效期（JWT payload）
 ```
 
-token 存在 `~/.config/ziroom/token.json`（0600）。短信验证码登录流程尚未实现——登录接口路径无法靠猜（网关按完整路径注册路由，不存在的子路径一律 404）。
+token 存在 `~/.config/ziroom/token.json`（0600）。
+
+### 短信验证码登录
+
+```bash
+.venv/bin/python monitor.py login --phone 13800138000
+```
+
+1. 终端会起一个本地页面（`http://127.0.0.1:<随机端口>/`）并自动打开浏览器；
+2. 在页面里**拖动滑块**完成极验，页面下方会出一行 JSON，复制粘回终端；
+3. 收到短信后输入 6 位验证码；
+4. token 自动写进 `~/.config/ziroom/token.json`。
+
+链路（全部走 ztoread 网关，请求体同样是 DES-CBC 密文）：
+
+| 步骤 | 接口 | 产出 |
+|---|---|---|
+| 滑块校验 | `POST /vcenter/captcha/validate?type=geetest` | `cvcode` |
+| 发短信 | `POST /vcenter/identity/vcode/get` | 短信（必须带 `cvcode`，否则 `40001 cvcode is expired or invalid`） |
+| 校验短信 | `POST /vcenter//identity/validate?type=message`（双斜杠） | `ivcode` |
+| 换 token | `POST /dp/dynamic/login/v6` | `data.resp.token` |
+
+极验的 `captcha_id` 固定为 `9dba4221bf3a7e527a553e4971e98b4c`，滑块必须在浏览器里人工拖一次（脚本拿不到 `captcha_output`/`pass_token`）。
 
 ## 脱敏说明
 

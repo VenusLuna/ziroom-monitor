@@ -5,6 +5,8 @@
     python monitor.py watch --city 110000 --pages 5 --interval 600
     python monitor.py list  --limit 20                        # 看库里现有房源
     python monitor.py events --limit 50                       # 看历史变化
+    python monitor.py token                                   # 看 token 剩余有效期
+    python monitor.py login --phone 13800138000               # 短信登录并保存 token
 
 变化类型:
     new     新上架 / 首次出现
@@ -25,13 +27,15 @@ import hmac
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import time
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
-from ziroom_api import TokenExpired, Ziroom, ZiroomError, load_token, jwt_payload, normalize
+from ziroom_api import (TokenExpired, Ziroom, ZiroomError, jwt_payload, load_token,
+                        normalize, save_token)
 
 DB_DEFAULT = "ziroom.db"
 DISTRICTS_FILE = "districts.json"
@@ -488,6 +492,150 @@ def cmd_token(args):
         print("payload 里没有 exp 字段")
 
 
+# ---------------------------------------------------------------- 短信登录
+# 登录链路（抓包解密所得，全部走 ztoread 网关）:
+#   1. /vcenter/captcha/validate?type=geetest  极验滑块 → cvcode
+#   2. /vcenter/identity/vcode/get             发短信（必须带 cvcode）
+#   3. /vcenter//identity/validate?type=message  校验短信 → ivcode（注意双斜杠）
+#   4. /dp/dynamic/login/v6                    换 token
+CAPTCHA_ID = "9dba4221bf3a7e527a553e4971e98b4c"
+LOGIN_BASE = {
+    "scenario": "login", "uid": "0", "scene": "login_phone",
+    "module": "ziroom_app_ios", "bizCode": "rent_o2o",
+    "appId": "ziruke", "captchaID": CAPTCHA_ID,
+}
+
+CAPTCHA_HTML = """<!doctype html>
+<meta charset="utf-8">
+<title>自如登录验证</title>
+<style>body{font:14px -apple-system,BlinkMacSystemFont,sans-serif;margin:24px;max-width:520px}
+textarea{width:100%;height:110px;font:12px ui-monospace,monospace}</style>
+<h3>拖动滑块完成验证</h3>
+<div id="box"></div>
+<p>验证通过后，把下面这一行整段复制回终端：</p>
+<textarea id="out" readonly></textarea>
+<script src="https://static.geetest.com/v4/gt4.js"></script>
+<script>
+initGeetest4({captchaId: "__CAPTCHA_ID__", product: "bind"}, function (g) {
+  g.onReady(function () {
+    g.appendTo("#box");
+    if (g.showCaptcha) g.showCaptcha();
+  });
+  g.onSuccess(function () {
+    document.getElementById("out").value = JSON.stringify(g.getValidate());
+  });
+  g.onError(function (e) {
+    document.getElementById("out").value = "ERROR " + JSON.stringify(e);
+  });
+});
+</script>
+""".replace("__CAPTCHA_ID__", CAPTCHA_ID)
+
+
+class _CaptchaServer:
+    """本地起一个最小的 HTTP 服务。
+
+    极验 SDK 会用 window.location.protocol 拼 gcaptcha4 的地址，file:// 下变成
+    file://gcaptcha4.geetest.com/load… 直接失败，所以必须给个 http 源。
+    """
+
+    def __init__(self, html: str):
+        import threading
+        from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+        body = html.encode()
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_GET(self):  # noqa: N802
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, *a):
+                pass
+
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        self.port = self.httpd.server_address[1]
+        self.url = f"http://127.0.0.1:{self.port}/"
+        self.thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
+        self.thread.start()
+
+    def close(self):
+        self.httpd.shutdown()
+        self.httpd.server_close()
+
+
+def _read_captcha(arg: str | None) -> dict:
+    if arg:
+        raw = arg
+    else:
+        srv = _CaptchaServer(CAPTCHA_HTML)
+        try:
+            subprocess.run(["open", srv.url], check=False)
+            print(f"已打开验证页 {srv.url}")
+            print("拖动滑块 → 复制框里的 JSON → 粘贴到下面回车")
+            raw = input("captcha> ").strip()
+        finally:
+            srv.close()
+    try:
+        v = json.loads(raw)
+    except ValueError as e:
+        raise SystemExit(f"不是合法 JSON（{e}）：{raw[:80]}")
+    return {
+        "lotNumber": v.get("lot_number") or v.get("lotNumber", ""),
+        "captchaOutput": v.get("captcha_output") or v.get("captchaOutput", ""),
+        "passToken": v.get("pass_token") or v.get("passToken", ""),
+        "genTime": str(v.get("gen_time") or v.get("genTime", "")),
+    }
+
+
+def cmd_login(args):
+    phone = (args.phone or input("手机号> ")).strip()
+    if not (len(phone) == 11 and phone.isdigit()):
+        raise SystemExit("手机号要 11 位数字")
+    z = Ziroom()
+
+    cap = _read_captcha(args.captcha)
+    r = z.call("/vcenter/captcha/validate?type=geetest", {**LOGIN_BASE, **cap},
+               allow_http_error=True)
+    data = (r or {}).get("data") or {}
+    cvcode = data.get("cvcode") or ""
+    if data.get("status") != "success" or not cvcode:
+        raise SystemExit(f"滑块校验未通过：{data.get('reason') or json.dumps(r, ensure_ascii=False)[:200]}")
+    print("✔ 滑块校验通过")
+
+    r = z.call("/vcenter/identity/vcode/get",
+               {**LOGIN_BASE, "phone": phone, "cvcode": cvcode})
+    if "data" not in (r or {}):
+        raise SystemExit(f"发验证码失败：{json.dumps(r, ensure_ascii=False)[:200]}")
+    print(f"✔ 验证码已发送到 {phone[:3]}****{phone[-4:]}")
+    code = (args.vcode or input("短信验证码> ")).strip()
+    if not (len(code) == 6 and code.isdigit()):
+        raise SystemExit("验证码要 6 位")
+
+    r = z.call("/vcenter//identity/validate?type=message",
+               {**LOGIN_BASE, "phone": phone, "vcode": code})
+    ivcode = ((r or {}).get("data") or {}).get("ivcode") or ""
+    if not ivcode:
+        raise SystemExit(f"验证码校验失败：{json.dumps((r or {}).get('data'), ensure_ascii=False)}")
+    print("✔ 短信校验通过")
+
+    r = z.call("/dp/dynamic/login/v6",
+               {"ivcode": ivcode, "phone": phone, "needDefaultPassword": 1, "uid": "0"},
+               allow_http_error=True)
+    tok = ((((r or {}).get("data") or {}).get("resp")) or {}).get("token") or ""
+    if not tok:
+        raise SystemExit(f"登录失败：{json.dumps(r, ensure_ascii=False)[:300]}")
+    save_token(tok, phone)
+    info = jwt_payload(tok)
+    exp = info.get("exp")
+    print(f"✔ 登录成功 uid={info.get('uid', '?')} token 已存 ~/.config/ziroom/token.json")
+    if exp:
+        print(f"  过期时间 {datetime.fromtimestamp(exp):%Y-%m-%d %H:%M}")
+
+
 def cmd_test(args):
     cfg = load_notify(args)
     if not cfg.get("webhook") and not (cfg.get("app_id") and cfg.get("app_secret")):
@@ -583,6 +731,10 @@ def main():
         parser.add_argument("--radius", type=float, default=d(4.0),
                             help="near 用：直线半径 km（自行车 20min ≈ 4km）")
         parser.add_argument("--max-price", type=int, default=d(None), help="near 用：价格上限")
+        parser.add_argument("--phone", default=d(None), help="login 用：手机号")
+        parser.add_argument("--vcode", default=d(None), help="login 用：短信验证码（不填则交互输入）")
+        parser.add_argument("--captcha", default=d(None),
+                            help="login 用：滑块 JSON（不填则打开验证页交互）")
 
     p = argparse.ArgumentParser(description="自如房源监控")
     add_options(p, sub=False)
@@ -590,7 +742,7 @@ def main():
     for name, func in (("once", cmd_once), ("watch", cmd_watch),
                        ("list", cmd_list), ("events", cmd_events),
                        ("districts", cmd_districts), ("test", cmd_test),
-                       ("token", cmd_token)):
+                       ("token", cmd_token), ("login", cmd_login)):
         sp = sub.add_parser(name)
         add_options(sp, sub=True)
         sp.set_defaults(func=func)

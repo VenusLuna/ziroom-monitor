@@ -152,8 +152,11 @@ class Ziroom:
             h["timestamp"] = str(int(time.time() * 1000))
         return h
 
-    def call(self, path: str, payload: dict) -> dict:
-        """发一次请求并解密，返回完整信封（不校验 code），用于探测新接口。"""
+    def call(self, path: str, payload: dict, allow_http_error: bool = False) -> dict:
+        """发一次请求并解密，返回完整信封（不校验 code），用于探测新接口。
+
+        allow_http_error=True 时 4xx 也尝试解出 body（登录类接口用 400 带业务错误）。
+        """
         body = self.encrypt(payload).encode()
         url = f"{self.base}/{path.lstrip('/')}"
         last = None
@@ -164,6 +167,14 @@ class Ziroom:
                     text = r.read().decode()
                 break
             except urllib.error.HTTPError as e:
+                if allow_http_error:
+                    raw = e.read().decode(errors="replace").strip()
+                    if raw:
+                        try:
+                            return self.decrypt(raw)
+                        except ZiroomError:
+                            pass
+                    return {"code": str(e.code), "message": f"HTTP {e.code}"}
                 # 网关对非法密文返回 500 且空 body；限流/网络问题重试
                 last = e
                 if e.code not in (429, 500, 502, 503, 504):
