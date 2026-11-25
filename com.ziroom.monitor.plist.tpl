@@ -17,6 +17,7 @@
         <string>__PROJECT_DIR__/near.db</string>
         <string>--notify-kinds</string>
         <string>new,gone,price,status</string>
+        <string>--sheet</string>
     </array>
 
     <key>WorkingDirectory</key>

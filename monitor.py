@@ -26,10 +26,12 @@ import hashlib
 import hmac
 import json
 import os
+import re
 import sqlite3
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
@@ -88,9 +90,11 @@ def connect(path: str) -> sqlite3.Connection:
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA)
     cols = {r[1] for r in conn.execute("PRAGMA table_info(rooms)")}
-    if "distance_km" not in cols:  # 老库平滑升级
-        conn.execute("ALTER TABLE rooms ADD COLUMN distance_km REAL")
-        conn.commit()
+    for col, typ in (("distance_km", "REAL"), ("house_type", "INTEGER"), ("bedroom", "INTEGER"),
+                     ("code", "TEXT"), ("floor", "TEXT"), ("floor_total", "TEXT")):
+        if col not in cols:  # 老库平滑升级
+            conn.execute(f"ALTER TABLE rooms ADD COLUMN {col} {typ}")
+            conn.commit()
     return conn
 
 
@@ -122,11 +126,14 @@ def record(conn: sqlite3.Connection, rooms: list[dict], threshold: int) -> list[
         if row is None:
             conn.execute(
                 """INSERT INTO rooms (id,name,price,district,bizcircle,resblock,area,
-                       sale_status,sale_status_text,url,first_seen,last_seen,miss_count,distance_km,active)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,1)""",
+                       sale_status,sale_status_text,url,first_seen,last_seen,miss_count,distance_km,
+                       house_type,bedroom,code,floor,floor_total,active)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?,?,?,1)""",
                 (rid, room["name"], room["price"], room["district"], room["bizcircle"],
                  room["resblock"], room["area"], room["sale_status"], room["sale_status_text"],
-                 room["url"], ts, ts, room.get("distance_km")),
+                 room["url"], ts, ts, room.get("distance_km"),
+                 room.get("house_type"), room.get("bedroom"), room.get("code"),
+                 room.get("floor"), room.get("floor_total")),
             )
             events.append({"kind": "new", "id": rid, "name": room["name"],
                            "price": room["price"], "district": room["district"],
@@ -149,11 +156,13 @@ def record(conn: sqlite3.Connection, rooms: list[dict], threshold: int) -> list[
         conn.execute(
             """UPDATE rooms SET name=?, price=?, district=?, bizcircle=?, resblock=?, area=?,
                    sale_status=?, sale_status_text=?, url=?, last_seen=?, miss_count=0, active=1,
-                   distance_km=COALESCE(?, distance_km)
+                   distance_km=COALESCE(?, distance_km), house_type=?, bedroom=?, code=?,
+                   floor=?, floor_total=?
                WHERE id=?""",
             (room["name"], room["price"], room["district"], room["bizcircle"], room["resblock"],
              room["area"], room["sale_status"], room["sale_status_text"], room["url"], ts,
-             room.get("distance_km"), rid),
+             room.get("distance_km"), room.get("house_type"), room.get("bedroom"),
+             room.get("code"), room.get("floor"), room.get("floor_total"), rid),
         )
 
     # 未出现的房源：累计 miss，达到阈值判定下架
@@ -269,6 +278,186 @@ def send_feishu_dm(cfg: dict, text: str) -> str:
     if resp.get("code"):
         raise RuntimeError(f"发私聊失败: {resp}")
     return open_id
+
+
+# ---------------------------------------------------------------- 飞书多维表格
+# 字段：(名字, bitable type, property)；type 1=文本 2=数字 5=日期 15=超链接
+BITABLE_FIELDS = [
+    ("房源ID", 1, None),
+    ("小区", 1, None),
+    ("户型", 1, None),
+    ("几居", 2, {"formatter": "0"}),
+    ("价格", 2, {"formatter": "0"}),
+    ("面积㎡", 2, {"formatter": "0.0"}),
+    ("距离km", 2, {"formatter": "0.00"}),
+    ("楼层", 1, None),
+    ("状态", 1, None),
+    ("链接", 15, None),
+    ("首次发现", 5, {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}),
+    ("最近更新", 5, {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}),
+]
+
+
+def _bitable(method: str, path: str, token: str, body: dict | None = None) -> dict:
+    url = f"{FEISHU_API}/bitable/v1/apps/{path}"
+    data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
+    req = urllib.request.Request(url, data=data, method=method, headers={
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json; charset=utf-8",
+    })
+    try:
+        with urllib.request.urlopen(req, timeout=30) as r:
+            resp = json.loads(r.read())
+    except urllib.error.HTTPError as e:
+        raise RuntimeError(f"多维表格 HTTP {e.code}: {e.read()[:300].decode(errors='replace')}") from e
+    if resp.get("code"):
+        raise RuntimeError(f"多维表格 API 失败: {resp}")
+    return resp.get("data") or {}
+
+
+def ensure_sheet_fields(cfg: dict, token: str) -> None:
+    """把表格字段补成 BITABLE_FIELDS：主字段改名，缺的补上。"""
+    app, tbl = cfg["bitable_app_token"], cfg["bitable_table_id"]
+    items = _bitable("GET", f"{app}/tables/{tbl}/fields?page_size=100", token).get("items") or []
+    have = {f["field_name"] for f in items}
+    primary = next((f for f in items if f.get("is_primary")), None)
+    if primary and primary["field_name"] != "房源ID":
+        _bitable("PUT", f"{app}/tables/{tbl}/fields/{primary['field_id']}", token,
+                 {"field_name": "房源ID", "type": 1})
+        have.add("房源ID")
+    for name, typ, prop in BITABLE_FIELDS:
+        if name in have:
+            continue
+        body = {"field_name": name, "type": typ}
+        if prop:
+            body["property"] = prop
+        try:
+            _bitable("POST", f"{app}/tables/{tbl}/fields", token, body)
+        except RuntimeError as e:
+            print(f"[warn] 建字段 {name} 失败: {e}", file=sys.stderr)
+
+
+def _ms(ts: str | None) -> int | None:
+    if not ts:
+        return None
+    try:
+        return int(datetime.strptime(ts, "%Y-%m-%d %H:%M:%S")
+                   .replace(tzinfo=timezone.utc).astimezone().timestamp() * 1000)
+    except ValueError:
+        return None
+
+
+def _num(v):
+    """'约7.9' / '6.4' / 13 → float。"""
+    if v is None or v == "":
+        return None
+    m = re.search(r"\d+(?:\.\d+)?", str(v))
+    return float(m.group()) if m else None
+
+
+def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
+    """库里的房源 → 表格行（字段名与 BITABLE_FIELDS 对齐）。"""
+    rows = conn.execute("SELECT * FROM rooms ORDER BY price").fetchall()
+    out = []
+    for r in rows:
+        bedroom, code = r["bedroom"], r["code"]
+        layout = f"{bedroom}居·{code}卧" if bedroom and code else (r["name"] or "")
+        floor = f"{r['floor']}/{r['floor_total']}" if r["floor"] else ""
+        out.append({
+            "房源ID": r["id"],
+            "小区": r["resblock"] or r["name"] or "",
+            "户型": layout,
+            "几居": int(bedroom) if bedroom else None,
+            "价格": r["price"],
+            "面积㎡": _num(r["area"]),
+            "距离km": round(r["distance_km"], 2) if r["distance_km"] is not None else None,
+            "楼层": floor,
+            "状态": r["sale_status_text"] or ("已下架" if not r["active"] else ""),
+            "链接": {"link": r["url"], "text": "打开房源"} if r["url"] else None,
+            "首次发现": _ms(r["first_seen"]),
+            "最近更新": _ms(r["last_seen"]),
+        })
+    return out
+
+
+DIFF_KEYS = ("价格", "距离km", "状态", "户型", "楼层", "小区", "面积㎡", "几居", "链接")
+
+
+def _same(old, new) -> bool:
+    """表格里的值（API 常把数字返回成字符串）和本地值是否等价。"""
+    if isinstance(new, dict):
+        return (old.get("link") if isinstance(old, dict) else old) == new.get("link")
+    on, nn = _num(old), _num(new)
+    if on is not None and nn is not None:
+        return abs(on - nn) < 1e-6
+    return str(old or "").strip() == str(new or "").strip()
+
+
+def _cell(rec: dict, name: str):
+    v = (rec.get("fields") or {}).get(name)
+    if isinstance(v, list):  # 文本/多选是富文本数组
+        v = "".join(x.get("text", "") for x in v if isinstance(x, dict))
+    if isinstance(v, dict):  # 超链接
+        v = v.get("link") or v.get("text")
+    return v
+
+
+def sync_sheet(cfg: dict, conn: sqlite3.Connection, dry_run: bool = False) -> tuple[int, int]:
+    """把库内房源 upsert 到多维表格，返回 (新增, 更新)。"""
+    app, tbl = cfg["bitable_app_token"], cfg["bitable_table_id"]
+    token = _feishu_token(cfg["app_id"], cfg["app_secret"])
+    ensure_sheet_fields(cfg, token)
+
+    existing: dict[str, dict] = {}
+    page_token, total = "", 0
+    while True:
+        path = f"{app}/tables/{tbl}/records?page_size=500"
+        if page_token:
+            path += f"&page_token={urllib.parse.quote(page_token)}"
+        data = _bitable("GET", path, token)
+        for rec in data.get("items") or []:
+            rid = _cell(rec, "房源ID")
+            if rid:
+                existing[str(rid)] = rec
+        total += len(data.get("items") or [])
+        page_token = data.get("page_token") or ""
+        if not data.get("has_more") or not page_token:
+            break
+
+    create, update = [], []
+    for row in sheet_rows(conn):
+        cur = existing.get(row["房源ID"])
+        if cur is None:
+            create.append({"fields": row})
+            continue
+        fields = cur.get("fields") or {}
+        if any(not _same(_cell({"fields": fields}, k), row[k])
+               for k in DIFF_KEYS if row[k] is not None):
+            update.append({"record_id": cur["record_id"], "fields": row})
+
+    if dry_run:
+        return len(create), len(update)
+
+    for i in range(0, len(create), 500):
+        _bitable("POST", f"{app}/tables/{tbl}/records/batch_create", token,
+                 {"records": create[i:i + 500]})
+    for i in range(0, len(update), 500):
+        _bitable("POST", f"{app}/tables/{tbl}/records/batch_update", token,
+                 {"records": update[i:i + 500]})
+    return len(create), len(update)
+
+
+def cmd_sheet(args):
+    cfg = load_notify(args)
+    if not (cfg.get("bitable_app_token") and cfg.get("bitable_table_id")):
+        raise SystemExit("没配置多维表格：feishu.json 需要 bitable_app_token / bitable_table_id")
+    conn = connect(args.db)
+    created, updated = sync_sheet(cfg, conn, dry_run=getattr(args, "dry_run", False))
+    conn.close()
+    print(f"多维表格：新增 {created} 行 · 更新 {updated} 行"
+          + ("（dry-run，未写入）" if getattr(args, "dry_run", False) else ""))
+    if cfg.get("bitable_url"):
+        print(f"  {cfg['bitable_url']}")
 
 
 def _feishu_sign(secret: str, timestamp: int) -> str:
@@ -464,13 +653,20 @@ def sweep(args) -> list[dict]:
     conn = connect(args.db)
     events = record(conn, rooms, args.misses)
     active = conn.execute("SELECT COUNT(*) FROM rooms WHERE active=1").fetchone()[0]
-    conn.close()
     print(f"[{now()}] 拉取 {len(rooms)} 条（{total}），库内在租 {active} 条，"
           f"耗时 {time.time() - t0:.1f}s")
     print_events(events)
     kinds = {k.strip() for k in (args.notify_kinds or "").split(",") if k.strip()}
     to_send = [e for e in events if not kinds or e["kind"] in kinds]
-    notify(load_notify(args), to_send)
+    cfg = load_notify(args)
+    notify(cfg, to_send)
+    if getattr(args, "sheet", False):
+        try:
+            created, updated = sync_sheet(cfg, conn, dry_run=getattr(args, "dry_run", False))
+            print(f"  多维表格：新增 {created} 行 · 更新 {updated} 行")
+        except Exception as e:  # 表格挂了不能拖垮扫描
+            print(f"[warn] 同步多维表格失败: {e}", file=sys.stderr)
+    conn.close()
     return events
 
 
@@ -735,6 +931,10 @@ def main():
         parser.add_argument("--vcode", default=d(None), help="login 用：短信验证码（不填则交互输入）")
         parser.add_argument("--captcha", default=d(None),
                             help="login 用：滑块 JSON（不填则打开验证页交互）")
+        parser.add_argument("--sheet", action="store_true", default=d(False),
+                            help="每次扫描后同步到飞书多维表格")
+        parser.add_argument("--dry-run", action="store_true", default=d(False),
+                            help="sheet 用：只算差异不写入")
 
     p = argparse.ArgumentParser(description="自如房源监控")
     add_options(p, sub=False)
@@ -742,7 +942,7 @@ def main():
     for name, func in (("once", cmd_once), ("watch", cmd_watch),
                        ("list", cmd_list), ("events", cmd_events),
                        ("districts", cmd_districts), ("test", cmd_test),
-                       ("token", cmd_token), ("login", cmd_login)):
+                       ("token", cmd_token), ("login", cmd_login), ("sheet", cmd_sheet)):
         sp = sub.add_parser(name)
         add_options(sp, sub=True)
         sp.set_defaults(func=func)

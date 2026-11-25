@@ -70,6 +70,27 @@ python3 -m venv .venv
 
 推送范围由 `--notify-kinds` 控制，默认 `new,gone`，可加 `price,status`。
 
+## 飞书多维表格
+
+把库内房源同步成一张可以直接排序、筛选的表（字段：房源ID / 小区 / 户型 / 几居 / 价格 / 面积㎡ / 距离km / 楼层 / 状态 / 链接 / 首次发现 / 最近更新）。
+
+一次性建好：应用需要 `bitable:app` 权限，创建一个多维表格，把应用加成「可编辑」协作者，然后把 `app_token`（`/base/<app_token>`）、`table_id`（`?table=tbl…`）写进 `feishu.json`：
+
+```json
+{"app_id": "cli_…", "app_secret": "…", "open_id": "ou_…",
+ "bitable_app_token": "bascn…", "bitable_table_id": "tbl…"}
+```
+
+```bash
+.venv/bin/python monitor.py sheet            # 全量 upsert：新行插入，价格/距离变动才更新
+.venv/bin/python monitor.py sheet --dry-run  # 只算差异不写入
+.venv/bin/python monitor.py once --near --sheet   # 每次扫描后顺带同步
+```
+
+- 字段不存在的会自动创建（`ensure_sheet_fields`）；主字段会被改名为 `房源ID`，这是 upsert 的键，别手动改。
+- 只有新增行、价格或距离变化才写，避免每 2 小时刷 419 行；用户自己加的列不会被覆盖。
+- 下架房源不删行，状态列写成 `已下架`。
+
 ## 定时任务（macOS）
 
 ```bash
