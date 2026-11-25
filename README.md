@@ -120,6 +120,17 @@ python3 -m venv .venv
 - 增量：`images` 表里已有的房源不再抓；`--image-limit 500` 可一次补齐（并发由 `--workers` 控制）。
 - 并发：扫楼、下图、传图都走线程池，`--workers 16` 时一轮扫描约 20 秒、400 套图约 3 分钟。
 
+## 户型图
+
+```bash
+.venv/bin/python monitor.py plans --db near.db            # 查一遍还没查过的房源
+.venv/bin/python monitor.py once --near --plans --sheet    # 扫描时顺带查
+```
+
+户型图来自 `/thorApi/v1/detail/media.json` 里 `tab_type=1` 的那一栏（标题「户型图」），存 `plans/<房源ID>.jpg`，同时传多维表格「户型图」附件列。
+
+**限制（实测）**：接口只对**整租**房源下发户型图。本监控全部是合租房源，419 套逐套查过，0 套有图——查到没有也会在 `plans` 表记一行，不会反复重试。等以后监控范围扩到整租，这一列会自动填上。
+
 ## 舍友信息
 
 列表接口的 `brief.室友` 直接带每个卧室的性别和昵称，`normalize()` 会算出「几男几女」：

@@ -250,6 +250,21 @@ class Ziroom:
                                 "image_id": p.get("image_id") or ""})
         return out
 
+    def room_plan(self, room_id: str, inv_no: str = "", house_code: str = "") -> str | None:
+        """户型图 URL（media 里 tab_type=1 的那一栏）。合租房源接口不下发，返回 None。"""
+        data = self.post("/thorApi/v1/detail/media.json", {
+            "id": str(room_id),
+            "uid": "0",
+            "house_code": str(house_code or room_id),
+            "inv_no": str(inv_no or ""),
+        })
+        for tab in data.get("tabs") or []:
+            if tab.get("tab_type") == 1 or "户型" in (tab.get("title") or ""):
+                for photo in tab.get("photos") or []:
+                    if isinstance(photo, dict) and photo.get("image"):
+                        return photo["image"]
+        return None
+
     def map_regions(self, min_lng, min_lat, max_lng, max_lat,
                     center_lng=None, center_lat=None, city_code: str = "110000") -> dict:
         """地图视野内的楼栋聚合（含每栋在租套数、起价），用于发现小区。"""

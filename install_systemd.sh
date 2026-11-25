@@ -17,7 +17,8 @@ Description=自如房源监控
 Type=oneshot
 WorkingDirectory=${DIR}
 ExecStart=${PY} ${DIR}/monitor.py once --near --max-price 3700 --db ${DIR}/near.db \\
-    --notify-kinds new,gone,price,status --misses 2 --sheet --images --image-limit 60 --workers 16
+    --notify-kinds new,gone,price,status --misses 2 --sheet --images --image-limit 60 \\
+    --plans --plan-limit 60 --workers 16
 StandardOutput=append:${DIR}/logs/monitor.log
 StandardError=append:${DIR}/logs/monitor.err
 UNIT

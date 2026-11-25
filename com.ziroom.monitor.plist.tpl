@@ -20,6 +20,7 @@
         <string>--misses</string>
         <string>2</string>
         <string>--sheet</string>
+        <string>--plans</string>
         <string>--images</string>
         <string>--image-limit</string>
         <string>60</string>

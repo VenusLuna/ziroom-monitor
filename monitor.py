@@ -9,6 +9,7 @@
     python monitor.py login --phone 13800138000               # 短信登录并保存 token
     python monitor.py sheet [--images]                        # 同步飞书多维表格（可先补房源图）
     python monitor.py images --image-limit 20                 # 抓房源图：本地 images/ + 表格附件
+    python monitor.py plans                                    # 抓户型图（仅整租房源有）
 
 变化类型:
     new     新上架 / 首次出现
@@ -82,6 +83,13 @@ CREATE TABLE IF NOT EXISTS images (
     file_token TEXT,
     ts         TEXT,
     PRIMARY KEY (room_id, idx)
+);
+CREATE TABLE IF NOT EXISTS plans (
+    room_id    TEXT PRIMARY KEY,
+    path       TEXT,
+    url        TEXT,
+    file_token TEXT,
+    ts         TEXT
 );
 CREATE TABLE IF NOT EXISTS events (
     ts      TEXT,
@@ -318,6 +326,7 @@ BITABLE_FIELDS = [
     ("链接", 15, None),
     ("首次发现", 5, {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}),
     ("最近更新", 5, {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}),
+    ("户型图", 17, None),
     ("房源图", 17, None),
     # 单选：自己跟进用，同步永不改写已有值，新行默认「候选」
     ("标记", 3, {"options": [{"name": "候选"}, {"name": "待看"}, {"name": "排除"}]}),
@@ -377,6 +386,7 @@ def ensure_sheet_fields(cfg: dict, token: str) -> None:
 MARK_DEFAULT = "候选"
 
 IMAGES_DIR = Path("images")
+PLANS_DIR = Path("plans")
 PER_ROOM_IMAGES = 3
 
 
@@ -442,6 +452,76 @@ def _grab_one(client: Ziroom, row, per_room: int) -> tuple[str, list[tuple[int, 
             _download(url, dest)
         saved.append((i, str(dest), url))
     return rid, saved
+
+
+def _grab_plan(client: Ziroom, row) -> tuple[str, str | None, str | None]:
+    """单套取户型图（线程里跑）。接口没有就返回 (id, None, None)。"""
+    rid = row["id"]
+    inv = row["inv_no"] or ""
+    if not inv:
+        m = re.search(r"/x/(\d+)\.html", row["url"] or "")
+        inv = m.group(1) if m else ""
+    url = client.room_plan(rid, inv_no=inv)
+    if not url:
+        return rid, None, None
+    dest = PLANS_DIR / f"{rid}.jpg"
+    if not dest.exists():
+        _download(url, dest)
+    return rid, str(dest), url
+
+
+def fetch_plans(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
+                limit: int = 50, workers: int = 8) -> tuple[int, int]:
+    """抓户型图到 plans/<id>.jpg，再传多维表格「户型图」附件列。
+
+    只有整租房源的详情接口下发户型图；合租（本监控全部是合租）拿不到，会记为「无」不再重试。
+    返回 (本次取到图的套数, 本次上传的张数)。
+    """
+    token = None
+    if cfg.get("app_id") and cfg.get("app_secret") and cfg.get("bitable_app_token"):
+        token = _feishu_token(cfg["app_id"], cfg["app_secret"])
+    app = cfg.get("bitable_app_token")
+
+    todo = conn.execute(
+        """SELECT id, inv_no, url FROM rooms
+            WHERE id NOT IN (SELECT room_id FROM plans)
+            ORDER BY active DESC, distance_km, price LIMIT ?""", (limit,)).fetchall()
+    if not todo:
+        return 0, 0
+
+    workers = max(1, int(workers or 8))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futs = {ex.submit(_grab_plan, client, row): row["id"] for row in todo}
+        for f in as_completed(futs):
+            rid = futs[f]
+            try:
+                rid, path, url = f.result()
+            except Exception as e:
+                print(f"[warn] {rid} 取户型图失败: {e}", file=sys.stderr)
+                continue
+            conn.execute("INSERT OR REPLACE INTO plans (room_id, path, url, file_token, ts) "
+                         "VALUES (?,?,?,NULL,?)", (rid, path, url, now()))
+            conn.commit()
+
+    upload = conn.execute("SELECT room_id, path FROM plans "
+                          "WHERE file_token IS NULL AND path IS NOT NULL").fetchall()
+    uploaded = 0
+    if token and app:
+        with ThreadPoolExecutor(max_workers=min(workers, 4)) as ex:
+            futs = {ex.submit(_upload_media, token, app, Path(r["path"])): r["room_id"]
+                    for r in upload if Path(r["path"]).exists()}
+            for f in as_completed(futs):
+                rid = futs[f]
+                try:
+                    ft = f.result()
+                except Exception as e:
+                    print(f"[warn] {rid} 户型图上传失败: {e}", file=sys.stderr)
+                    continue
+                conn.execute("UPDATE plans SET file_token=? WHERE room_id=?", (ft, rid))
+                uploaded += 1
+        conn.commit()
+    got = conn.execute("SELECT COUNT(*) FROM plans WHERE path IS NOT NULL").fetchone()[0]
+    return got, uploaded
 
 
 def fetch_images(conn: sqlite3.Connection, client: Ziroom, cfg: dict,
@@ -562,6 +642,10 @@ def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
     for r in conn.execute("SELECT room_id, file_token FROM images "
                           "WHERE file_token IS NOT NULL ORDER BY room_id, idx"):
         pics.setdefault(r["room_id"], []).append({"file_token": r["file_token"]})
+    plans: dict[str, list[dict]] = {}
+    for r in conn.execute("SELECT room_id, file_token FROM plans "
+                          "WHERE file_token IS NOT NULL"):
+        plans[r["room_id"]] = [{"file_token": r["file_token"]}]
     out = []
     for r in rows:
         bedroom, code = r["bedroom"], r["code"]
@@ -583,6 +667,7 @@ def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
             "首次发现": _ms(r["first_seen"]),
             "最近更新": _ms(r["last_seen"]),
             "房源图": pics.get(r["id"]) or None,
+            "户型图": plans.get(r["id"]) or None,
             "标记": MARK_DEFAULT,
         })
     return out
@@ -642,10 +727,11 @@ def sync_sheet(cfg: dict, conn: sqlite3.Connection, dry_run: bool = False) -> tu
         fields = cur.get("fields") or {}
         changed = any(not _same(_cell({"fields": fields}, k), row[k])
                       for k in DIFF_KEYS if row[k] is not None)
-        if not changed and row["房源图"]:
-            have = {a.get("file_token") for a in fields.get("房源图") or []
-                    if isinstance(a, dict)}
-            changed = not {p["file_token"] for p in row["房源图"]} <= have
+        for col in ("房源图", "户型图"):
+            if changed or not row[col]:
+                continue
+            have = {a.get("file_token") for a in fields.get(col) or [] if isinstance(a, dict)}
+            changed = not {p["file_token"] for p in row[col]} <= have
         if not changed and not (fields.get("标记") or []):
             changed = True  # 老行补默认「候选」
         if changed:
@@ -681,6 +767,17 @@ def cmd_images(args):
     print(f"房源图：抓取 {fetched} 套（上传 {uploaded} 张）· 还差 {left} 套没图")
 
 
+def cmd_plans(args):
+    cfg = load_notify(args)
+    conn = connect(args.db)
+    got, uploaded = fetch_plans(conn, Ziroom(), cfg, limit=args.plan_limit,
+                                workers=args.workers)
+    left = conn.execute("SELECT COUNT(*) FROM rooms WHERE id NOT IN "
+                        "(SELECT room_id FROM plans)").fetchone()[0]
+    conn.close()
+    print(f"户型图：已抓到 {got} 套（本次上传 {uploaded} 张）· 还没查过 {left} 套")
+
+
 def cmd_sheet(args):
     cfg = load_notify(args)
     if not (cfg.get("bitable_app_token") and cfg.get("bitable_table_id")):
@@ -691,6 +788,11 @@ def cmd_sheet(args):
                                          per_room=args.per_room, workers=args.workers)
         if fetched or uploaded:
             print(f"房源图：抓取 {fetched} 套（上传 {uploaded} 张）")
+    if getattr(args, "plans", False):
+        got, uploaded = fetch_plans(conn, Ziroom(), cfg, limit=args.plan_limit,
+                                    workers=args.workers)
+        if uploaded:
+            print(f"户型图：上传 {uploaded} 张")
     created, updated = sync_sheet(cfg, conn, dry_run=getattr(args, "dry_run", False))
     conn.close()
     print(f"多维表格：新增 {created} 行 · 更新 {updated} 行"
@@ -1009,6 +1111,14 @@ def sweep(args) -> list[dict]:
                 print(f"房源图：抓取 {fetched} 套（上传 {uploaded} 张）")
         except Exception as e:  # 抓图失败不影响主流程
             print(f"[warn] 抓图失败: {e}", file=sys.stderr)
+    if getattr(args, "plans", False):
+        try:
+            got, uploaded = fetch_plans(conn, client, cfg, limit=args.plan_limit,
+                                        workers=args.workers)
+            if uploaded:
+                print(f"户型图：上传 {uploaded} 张")
+        except Exception as e:  # 户型图失败不影响主流程
+            print(f"[warn] 抓户型图失败: {e}", file=sys.stderr)
     if getattr(args, "sheet", False):
         try:
             created, updated = sync_sheet(cfg, conn, dry_run=getattr(args, "dry_run", False))
@@ -1292,6 +1402,10 @@ def main():
                             help="images 用：本次最多给多少套房抓图")
         parser.add_argument("--per-room", type=int, default=d(PER_ROOM_IMAGES),
                             help="images 用：每套房最多几张图")
+        parser.add_argument("--plans", action="store_true", default=d(False),
+                            help="顺带抓户型图（只有整租房源接口下发）")
+        parser.add_argument("--plan-limit", type=int, default=d(50),
+                            help="plans 用：本轮最多查多少套")
 
     p = argparse.ArgumentParser(description="自如房源监控")
     add_options(p, sub=False)
@@ -1300,7 +1414,7 @@ def main():
                        ("list", cmd_list), ("events", cmd_events),
                        ("districts", cmd_districts), ("test", cmd_test),
                        ("token", cmd_token), ("login", cmd_login), ("sheet", cmd_sheet),
-                       ("images", cmd_images)):
+                       ("images", cmd_images), ("plans", cmd_plans)):
         sp = sub.add_parser(name)
         add_options(sp, sub=True)
         sp.set_defaults(func=func)
