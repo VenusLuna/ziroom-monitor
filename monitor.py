@@ -310,24 +310,37 @@ BITABLE_FIELDS = [
     ("首次发现", 5, {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}),
     ("最近更新", 5, {"date_formatter": "yyyy/MM/dd HH:mm", "auto_fill": False}),
     ("房源图", 17, None),
+    # 单选：自己跟进用，同步永不改写已有值，新行默认「候选」
+    ("标记", 3, {"options": [{"name": "候选"}, {"name": "待看"}, {"name": "排除"}]}),
 ]
 
 
-def _bitable(method: str, path: str, token: str, body: dict | None = None) -> dict:
+def _bitable(method: str, path: str, token: str, body: dict | None = None,
+             attempts: int = 4) -> dict:
     url = f"{FEISHU_API}/bitable/v1/apps/{path}"
     data = json.dumps(body, ensure_ascii=False).encode() if body is not None else None
-    req = urllib.request.Request(url, data=data, method=method, headers={
-        "Authorization": f"Bearer {token}",
-        "Content-Type": "application/json; charset=utf-8",
-    })
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            resp = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        raise RuntimeError(f"多维表格 HTTP {e.code}: {e.read()[:300].decode(errors='replace')}") from e
-    if resp.get("code"):
-        raise RuntimeError(f"多维表格 API 失败: {resp}")
-    return resp.get("data") or {}
+    for i in range(attempts):
+        req = urllib.request.Request(url, data=data, method=method, headers={
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json; charset=utf-8",
+        })
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                resp = json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            text = e.read()[:300].decode(errors="replace")
+            # 1254607 = 表格正在重建索引，等几秒重试即可
+            if "1254607" in text and i + 1 < attempts:
+                time.sleep(5 * (i + 1))
+                continue
+            raise RuntimeError(f"多维表格 HTTP {e.code}: {text}") from e
+        if resp.get("code") == 1254607 and i + 1 < attempts:
+            time.sleep(5 * (i + 1))
+            continue
+        if resp.get("code"):
+            raise RuntimeError(f"多维表格 API 失败: {resp}")
+        return resp.get("data") or {}
+    raise RuntimeError("多维表格：重试多次仍无响应")
 
 
 def ensure_sheet_fields(cfg: dict, token: str) -> None:
@@ -351,6 +364,8 @@ def ensure_sheet_fields(cfg: dict, token: str) -> None:
         except RuntimeError as e:
             print(f"[warn] 建字段 {name} 失败: {e}", file=sys.stderr)
 
+
+MARK_DEFAULT = "候选"
 
 IMAGES_DIR = Path("images")
 PER_ROOM_IMAGES = 3
@@ -502,6 +517,7 @@ def sheet_rows(conn: sqlite3.Connection) -> list[dict]:
             "首次发现": _ms(r["first_seen"]),
             "最近更新": _ms(r["last_seen"]),
             "房源图": pics.get(r["id"]) or None,
+            "标记": MARK_DEFAULT,
         })
     return out
 
@@ -563,8 +579,16 @@ def sync_sheet(cfg: dict, conn: sqlite3.Connection, dry_run: bool = False) -> tu
             have = {a.get("file_token") for a in fields.get("房源图") or []
                     if isinstance(a, dict)}
             changed = not {p["file_token"] for p in row["房源图"]} <= have
+        if not changed and not (fields.get("标记") or []):
+            changed = True  # 老行补默认「候选」
         if changed:
-            update.append({"record_id": cur["record_id"], "fields": row})
+            raw = fields.get("标记")  # 单选返回字符串，多选返回列表
+            if isinstance(raw, list):
+                raw = (raw[0].get("name") if raw and isinstance(raw[0], dict) else raw[0]) \
+                    if raw else ""
+            fields_row = dict(row)
+            fields_row["标记"] = (raw or "").strip() or MARK_DEFAULT  # 用户改过就保留
+            update.append({"record_id": cur["record_id"], "fields": fields_row})
 
     if dry_run:
         return len(create), len(update)
