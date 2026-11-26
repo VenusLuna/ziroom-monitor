@@ -31,9 +31,9 @@
     <key>WorkingDirectory</key>
     <string>__PROJECT_DIR__</string>
 
-    <!-- 每 2 小时扫一轮 -->
+    <!-- 每小时扫一轮 -->
     <key>StartInterval</key>
-    <integer>7200</integer>
+    <integer>3600</integer>
     <key>RunAtLoad</key>
     <true/>
 

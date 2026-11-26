@@ -101,7 +101,7 @@ python3 -m venv .venv
 ```
 
 - 字段不存在的会自动创建（`ensure_sheet_fields`）；主字段会被改名为 `房源ID`，这是 upsert 的键，别手动改。
-- 只有新增行、价格或距离变化才写，避免每 2 小时刷 419 行；用户自己加的列不会被覆盖。
+- 只有新增行、价格或距离变化才写，避免每小时刷 419 行；用户自己加的列不会被覆盖。
 - 状态列实时跟随接口：`可签约`→`可预订` 之类的变化会更新，房源连续缺席被判下架后写成 `已下架`（行不删，留作历史）。
 - 「标记」是单选列（候选 / 待看 / 排除），新行默认 **候选**；同步只补空值，**永不覆盖你手改的值**，所以放心在表里筛「待看」「排除」。
 
@@ -144,7 +144,7 @@ python3 -m venv .venv
 ## 定时任务（macOS）
 
 ```bash
-./install_launchd.sh          # 每 2 小时一轮，RunAtLoad
+./install_launchd.sh          # 每小时一轮，RunAtLoad
 launchctl kickstart -k gui/$(id -u)/com.ziroom.monitor   # 立刻跑一轮
 launchctl bootout gui/$(id -u)/com.ziroom.monitor        # 停掉
 ```
@@ -161,7 +161,7 @@ git clone <repo> ~/ziroomer && cd ~/ziroomer
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 mkdir -p ~/.config/ziroom && chmod 700 ~/.config/ziroom
 # 把本机 ~/.config/ziroom/{key.json,feishu.json} 拷过去，权限 600
-./install_systemd.sh                    # 用户级 timer，每 2 小时，不需 sudo
+./install_systemd.sh                    # 用户级 timer，每小时，不需 sudo
 loginctl enable-linger "$USER"          # 让 timer 在未登录时也跑
 ```
 
